@@ -1,0 +1,45 @@
+# VL-JEPA training configuration
+
+# Optimization
+optimizer:
+  lr: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+# Learning rate schedule
+scheduler:
+  warmup_steps: 1000
+  total_steps: 100000
+  type: cosine
+
+# Batch & data
+batch_size: 32
+num_workers: 4
+pin_memory: true
+
+# Mixed precision
+use_amp: true
+amp_dtype: bfloat16
+
+# Gradient clipping
+grad_clip_norm: 1.0
+
+# Logging
+log_interval: 50
+eval_interval: 1000
+save_interval: 5000
+
+# W&B
+wandb:
+  use: true
+  project: vl-jepa
+  run_name: null  # Auto-generated
+
+# Checkpointing
+checkpoint:
+  dir: checkpoints/
+  resume_from: null
+
+# Reproducibility
+deterministic: false
+benchmark_cudnn: true

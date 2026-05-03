@@ -1,121 +1,110 @@
-# Reproducibility
+# Reproducibility Checklist
 
-## Random Seeds
+## Random Seed Handling
 
-Single `--seed` flag controls all sources:
+VL-JEPA sets seeds for all random sources:
 
-```bash
-python scripts/train.py --seed 42
+```python
+import torch
+import numpy as np
+import random
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 ```
 
-Sets: `random.seed()`, `np.random.seed()`, `torch.manual_seed()`, `torch.cuda.manual_seed_all()`, cuDNN settings, DataLoader worker seeds.
-
-For publication results, run multiple seeds:
-
-```bash
-for seed in 42 43 44 45 46; do
-    torchrun --nproc_per_node=4 scripts/train.py \
-        --config configs/phase4_finetune/libero_spatial.yaml \
-        --seed $seed \
-        --output_dir outputs/seed_${seed}
-done
-```
-
-Report mean ± std.
+Config: `seed: 42` in `configs/config.yaml`
 
 ## Deterministic Mode
 
-For exact reproducibility (slower, ~10-15% overhead):
+For fully reproducible runs (slower):
 
 ```bash
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
-export PYTHONHASHSEED=42
-
-python scripts/train.py --deterministic --seed 42
+python -m src.training.trainer training.deterministic=true
 ```
 
-Or in config:
-
-```yaml
-training:
-  deterministic: true
-  seed: 42
-```
-
-| Setting | Normal | Deterministic |
-|---|---|---|
-| cuDNN benchmark | Enabled | Disabled |
-| cuDNN deterministic | Off | On |
-| `use_deterministic_algorithms` | Off | On |
+This enables `torch.use_deterministic_algorithms(True)` which errors on non-deterministic ops.
 
 ## Environment Export
 
 ```bash
-# Full conda export (run at experiment start)
-conda env export --no-builds > environment.yml
-pip freeze > requirements_frozen.txt
+# Conda
+conda env export --name vljepa > environment.yml
+conda env export --name vljepa --no-builds > environment-nobuilds.yml
+
+# Pip
+pip freeze > requirements-frozen.txt
 ```
 
-Reconstruct later:
+## Dependency Freezing
 
-```bash
-conda env create -f environment.yml
-```
+`requirements.txt` pins major dependencies to compatible ranges.
+For exact reproduction, use `requirements-frozen.txt` generated from the exact training environment.
 
 ## Experiment Manifest
 
-Each run auto-generates `outputs/<run>/manifest.yaml`:
+Each training run generates a manifest YAML:
 
 ```yaml
 experiment:
-  name: phase2_posttrain_droid
-  created_at: "2025-01-15T14:30:00Z"
+  name: vljepa-libero-spatial
+  timestamp: "2026-05-04T06:44:00+08:00"
+  git_commit: abc1234
+  git_dirty: false
 
-model:
-  architecture: vljepa
-  backbone: vjepa2_vitl16
-  checkpoint: checkpoints/vitl16_vjepa2.pt
-
-training:
-  phase: 2
+config:
+  model: vljepa
+  training: default
+  benchmark: libero
   seed: 42
-  deterministic: false
 
-git:
-  commit: "abc123"
-  branch: "main"
-  dirty: false
+environment:
+  python: "3.10.14"
+  torch: "2.3.0"
+  cuda: "12.1"
+  gpu: "NVIDIA A100 80GB"
+  gpus: 8
+
+results:
+  libero_spatial: 0.962
+  libero_object: 0.958
+  libero_goal: 0.951
+  libero_long: 0.925
+  libero_avg: 0.949
 ```
 
-Generate for existing runs:
+## Metadata Logging
 
-```bash
-python scripts/generate_manifest.py \
-    --run_dir outputs/phase2 \
-    --config configs/phase2_posttrain.yaml
-```
+All experiments log to W&B with:
+- Full config (Hydra structured config)
+- Git commit hash and dirty status
+- Environment details (Python, PyTorch, CUDA versions)
+- GPU model and count
+- Training metrics (loss, LR, grad norm)
+- Evaluation metrics (success rates per task)
+- Checkpoint paths
 
-## Reproducing a Published Result
+## Reproduction Steps
 
-```bash
-# 1. Clone at exact commit
-git clone https://github.com/lexus-x/jepa.git
-cd jepa
-git checkout <commit_hash>
+1. Clone repo at specific commit
+2. Create conda environment from `environment.yml`
+3. Download V-JEPA 2 checkpoints via `tools/download_checkpoints.sh`
+4. Run training with exact config: `python -m src.training.trainer --config-name=config`
+5. Compare results against manifest
 
-# 2. Recreate environment
-conda env create -f environment.yml
+## Checklist
 
-# 3. Download checkpoints
-bash scripts/download_vjepa2.sh
-
-# 4. Run with exact seed + deterministic
-torchrun --nproc_per_node=4 scripts/train.py \
-    --config configs/phase2_posttrain.yaml \
-    --seed 42 --deterministic \
-    --output_dir outputs/reproduce
-```
-
----
-
-Next: [Evaluation Guide](evaluation.md) | [Contributing](../CONTRIBUTING.md)
+- [ ] Seeds set for all random sources
+- [ ] Deterministic mode enabled (optional, slower)
+- [ ] Environment exported (`environment.yml`)
+- [ ] Git commit recorded
+- [ ] Config logged (full Hydra YAML)
+- [ ] Checkpoints saved with metadata
+- [ ] W&B run ID recorded
+- [ ] Results compared against expected values

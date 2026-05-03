@@ -1,0 +1,24 @@
+# LIBERO benchmark configuration
+
+name: libero
+suite: libero_spatial  # Options: libero_spatial, libero_object, libero_goal, libero_long
+num_episodes: 20
+max_episode_steps: 300
+resolution: 256
+seed: 42
+save_videos: false
+video_dir: eval_videos/
+
+# All suites to evaluate (used by run_libero_benchmark)
+all_suites:
+  - libero_spatial
+  - libero_object
+  - libero_goal
+  - libero_long
+
+# Conformal prediction settings for evaluation
+conformal:
+  alpha: 0.1
+  safety_radius: 10.0
+  weight_rot: 1.0
+  weight_trans: 1.0

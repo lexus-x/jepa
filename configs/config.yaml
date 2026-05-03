@@ -1,0 +1,31 @@
+# VL-JEPA main configuration
+# Uses Hydra for composable config management
+
+defaults:
+  - model: vljepa
+  - training: default
+  - benchmark: libero
+  - _self_
+
+# Project metadata
+project:
+  name: vl-jepa
+  description: "Vision-Language Joint Embedding Predictive Architecture for Robotic Manipulation"
+  version: "0.1.0"
+
+# Global settings
+seed: 42
+device: cuda
+debug: false
+
+# Logging
+logging:
+  level: INFO
+  format: "%(asctime)s | %(name)s | %(levelname)s | %(message)s"
+
+# Paths
+paths:
+  data: data/
+  checkpoints: checkpoints/
+  logs: logs/
+  videos: eval_videos/

@@ -1,0 +1,88 @@
+# ── Python ─────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ── IDE / editor ──────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.settings/
+.classpath
+*.sublime-project
+*.sublime-workspace
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── ML experiment artifacts ───────────────────────────────────────────────────
+outputs/
+logs/
+runs/
+checkpoints/
+wandb/
+mlruns/
+lightning_logs/
+tensorboard/
+
+# ── Model weights & checkpoints ───────────────────────────────────────────────
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+
+# ── Data (large files — download via scripts) ─────────────────────────────────
+data/
+datasets/
+*.hdf5
+*.h5
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# ── Secrets & environment ─────────────────────────────────────────────────────
+.env
+.env.*
+secrets/
+*.pem
+*.key
+credentials.json
+
+# ── OS files ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Coverage / test artifacts ─────────────────────────────────────────────────
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.pytest_cache/
+.mypy_cache/
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+*.log
+*.tmp
+.cache/
+.ruff_cache/

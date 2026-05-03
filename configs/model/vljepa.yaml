@@ -1,0 +1,46 @@
+# VL-JEPA model configuration
+
+# Visual encoder (V-JEPA 2 ViT-L/16)
+encoder:
+  name: vjepa2_vit_large
+  output_dim: 1024
+  temporal_patch_size: 2
+  spatial_patch_size: 16
+  input_resolution: 256
+  freeze: true
+  unfreeze_last_n: 2
+
+# Language adapter
+language_adapter:
+  model_name: all-MiniLM-L6-v2
+  visual_dim: 1024
+  hidden_dim: 512
+  num_layers: 3
+  dropout: 0.1
+  use_cross_attention: false
+  num_cross_heads: 8
+
+# Velocity field network
+velocity_field:
+  visual_dim: 1024
+  proprio_dim: 7
+  pose_emb_dim: 64
+  time_emb_dim: 128
+  hidden_dim: 512
+  num_layers: 6
+  dropout: 0.1
+
+# Flow matching
+flow_matching:
+  sigma_min: 0.001
+  sigma_max: 0.5
+  beta_alpha: 1.5
+  beta_beta: 1.0
+  metric_weight_rot: 1.0
+  metric_weight_trans: 1.0
+
+# Inference
+inference:
+  method: rk4  # "euler" or "rk4"
+  num_steps: 20
+  num_samples: 1  # For multi-sample inference

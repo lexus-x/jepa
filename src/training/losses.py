@@ -1,18 +1,15 @@
 """Flow matching losses and metrics for VL-JEPA training.
 
 Provides:
-    - FlowMatchingLoss: Weighted MSE loss for Riemannian flow matching
-    - Timestep sampling from Beta distribution
-    - Geodesic distance metric for evaluation
-
-NOTE: The task-conditioned metric tensor is now part of GeodesicFlowMatcher
-(TaskConditionedMetric). The loss here is a fallback for when the flow matcher's
-own loss is not used directly.
+    - FlowMatchingLoss: MSE loss that accepts an external metric network
+    - ConformalRegularizer: penalizes predictions outside conformal radius
+    - TimestepSampler: Beta-distributed timestep sampling
+    - Geodesic distance metrics for evaluation
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -22,57 +19,59 @@ from ..flow.se3_utils import se3_logmap, se3_geodesic_distance, _se3_inverse
 
 
 class FlowMatchingLoss(nn.Module):
-    """Flow matching MSE loss with optional metric tensor weighting.
+    """Flow matching MSE loss with pluggable metric tensor.
 
-    L = E_{t, x₀, x₁} ‖v_θ(x_t, t, z) - u_t‖²_g
+    L = E_{t, x₀, x₁} ‖v_θ - u_t‖²_g
 
-    When metric_weights is None (default), uses the task-conditioned metric
-    from GeodesicFlowMatcher instead. This class serves as a standalone
-    fallback or for ablation studies.
+    The metric g is provided externally (from GeodesicFlowMatcher.metric_net)
+    so there is exactly ONE metric network, not two disconnected copies.
 
     Args:
-        weight_rot: Metric weight for rotation components (ω ∈ ℝ³).
-        weight_trans: Metric weight for translation components (υ ∈ ℝ³).
-        loss_type: Loss type - "mse" (default) or "huber".
+        metric_fn: Callable(task_embedding) → [B, 6] metric weights.
+            If None, falls back to fixed identity metric [1,1,1,1,1,1].
+        loss_type: "mse" or "huber".
         huber_delta: Huber loss delta.
     """
 
     def __init__(
         self,
-        weight_rot: float = 1.0,
-        weight_trans: float = 1.0,
+        metric_fn: Optional[Callable[[Tensor], Tensor]] = None,
         loss_type: str = "mse",
         huber_delta: float = 1.0,
     ) -> None:
         super().__init__()
+        self.metric_fn = metric_fn
         self.loss_type = loss_type
         self.huber_delta = huber_delta
-        self.register_buffer(
-            "metric_weights",
-            torch.tensor([
-                weight_rot, weight_rot, weight_rot,
-                weight_trans, weight_trans, weight_trans,
-            ]),
-        )
 
     def forward(
         self,
         predicted: Tensor,
         target: Tensor,
+        task_embedding: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
     ) -> Tensor:
-        """Compute the flow matching loss with fixed metric weights.
+        """Compute the flow matching loss.
 
         Args:
             predicted: [B, 6] predicted velocities in se(3).
             target: [B, 6] target velocities in se(3).
+            task_embedding: [B, D] task features for metric conditioning.
+                Required when metric_fn is set.
             mask: [B] optional sample mask.
 
         Returns:
             loss: Scalar loss value.
         """
         diff = predicted - target
-        weighted_diff = diff * self.metric_weights.unsqueeze(0)
+
+        # Apply metric weighting
+        if self.metric_fn is not None and task_embedding is not None:
+            metric_weights = self.metric_fn(task_embedding)  # [B, 6]
+        else:
+            metric_weights = 1.0  # identity
+
+        weighted_diff = diff * metric_weights
 
         if self.loss_type == "mse":
             per_sample = (weighted_diff ** 2).sum(dim=-1)
@@ -88,6 +87,50 @@ class FlowMatchingLoss(nn.Module):
             per_sample = per_sample * mask
             return per_sample.sum() / (mask.sum() + 1e-8)
         return per_sample.mean()
+
+
+class ConformalRegularizer(nn.Module):
+    """Penalize predictions whose conformal radius exceeds a threshold.
+
+    During training, this encourages the model to produce predictions that
+    stay within a reasonable conformal ball, preventing the model from
+    learning degenerate solutions that require huge prediction sets.
+
+    L_conf = λ * ReLU(r - r_max)²
+
+    where r is the current conformal radius and r_max is the target max.
+
+    Args:
+        max_radius: Target maximum conformal radius.
+        weight: Regularization weight λ.
+    """
+
+    def __init__(self, max_radius: float = 2.0, weight: float = 0.1) -> None:
+        super().__init__()
+        self.max_radius = max_radius
+        self.weight = weight
+
+    def forward(
+        self,
+        predicted: Tensor,
+        target: Tensor,
+        current_radius: float,
+    ) -> Tensor:
+        """Compute conformal regularization loss.
+
+        Args:
+            predicted: [B, 6] predicted velocities.
+            target: [B, 6] target velocities.
+            current_radius: Current conformal radius from the calibrator.
+
+        Returns:
+            loss: Scalar regularization loss.
+        """
+        if current_radius <= self.max_radius:
+            return torch.tensor(0.0, device=predicted.device)
+
+        excess = current_radius - self.max_radius
+        return self.weight * excess ** 2
 
 
 class TimestepSampler:
@@ -118,15 +161,7 @@ class TimestepSampler:
 
 
 def geodesic_distance_metric(T_pred: Tensor, T_true: Tensor) -> dict[str, Tensor]:
-    """Compute geodesic distance metrics between predicted and true poses.
-
-    Args:
-        T_pred: [B, 4, 4] predicted SE(3) poses.
-        T_true: [B, 4, 4] ground truth SE(3) poses.
-
-    Returns:
-        metrics: Dictionary with geodesic_total, rotation_error, translation_error.
-    """
+    """Compute geodesic distance metrics between predicted and true poses."""
     total_dist = se3_geodesic_distance(T_pred, T_true)
 
     T_pred_inv = _se3_inverse(T_pred)
@@ -153,17 +188,7 @@ def compute_action_metrics(
     threshold_rot: float = 0.1,
     threshold_trans: float = 0.01,
 ) -> dict[str, float]:
-    """Compute high-level action prediction metrics.
-
-    Args:
-        predicted_actions: [B, 4, 4] predicted SE(3) actions.
-        ground_truth_actions: [B, 4, 4] ground truth actions.
-        threshold_rot: Rotation threshold for "close enough" (radians).
-        threshold_trans: Translation threshold for "close enough" (meters).
-
-    Returns:
-        metrics: Dictionary with scalar metrics.
-    """
+    """Compute high-level action prediction metrics."""
     metrics = geodesic_distance_metric(predicted_actions, ground_truth_actions)
 
     rot_close = (metrics["rotation_error"] < threshold_rot).float().mean()

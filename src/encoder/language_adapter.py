@@ -26,17 +26,82 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class SpatialPositionalEncoding(nn.Module):
+    """2D sinusoidal positional encoding for visual patch grid.
+
+    Injects explicit (row, col) coordinates so the spatial reasoning
+    module knows WHERE each token is in the image, enabling it to
+    ground spatial language ("left of", "above", "behind").
+
+    Args:
+        dim: Output dimension (must match feature dim).
+        grid_size: Spatial grid size (e.g. 16 for 256/16 patches).
+        num_temporal: Number of temporal patches.
+    """
+
+    def __init__(self, dim: int, grid_size: int = 16, num_temporal: int = 1) -> None:
+        super().__init__()
+        self.dim = dim
+        self.grid_size = grid_size
+        self.num_temporal = num_temporal
+
+        # Project (row, col, t) coordinates → dim
+        self.coord_proj = nn.Sequential(
+            nn.Linear(3, dim // 4),
+            nn.SiLU(),
+            nn.Linear(dim // 4, dim),
+        )
+        nn.init.zeros_(self.coord_proj[-1].weight)
+        nn.init.zeros_(self.coord_proj[-1].bias)
+
+    def forward(self, visual_tokens: Tensor) -> Tensor:
+        """Add spatial position encoding to visual tokens.
+
+        Args:
+            visual_tokens: [B, N, D] where N = num_temporal * grid_size^2.
+
+        Returns:
+            encoded: [B, N, D] with spatial information added.
+        """
+        B, N, D = visual_tokens.shape
+        device, dtype = visual_tokens.device, visual_tokens.dtype
+        gs = self.grid_size
+
+        # Build coordinate grid: (t, row, col) normalized to [0, 1]
+        coords = []
+        for t_idx in range(self.num_temporal):
+            for r in range(gs):
+                for c in range(gs):
+                    coords.append([
+                        t_idx / max(self.num_temporal - 1, 1),
+                        r / max(gs - 1, 1),
+                        c / max(gs - 1, 1),
+                    ])
+
+        coord_tensor = torch.tensor(coords, device=device, dtype=dtype)  # [N, 3]
+        coord_tensor = coord_tensor.unsqueeze(0).expand(B, -1, -1)  # [B, N, 3]
+
+        pos_enc = self.coord_proj(coord_tensor)  # [B, N, D]
+        return visual_tokens + pos_enc
+
+
 class SpatialReasoningModule(nn.Module):
     """Process spatial relationships between language and visual tokens.
 
     Takes cross-attended features and applies a lightweight transformer
     to reason about spatial concepts like "left", "above", "behind".
 
+    The visual tokens are injected with 2D grid coordinates BEFORE
+    cross-attention, so the spatial reasoning has access to explicit
+    position information — not just learned positional biases.
+
     Args:
         dim: Feature dimension.
         num_heads: Attention heads.
         num_layers: Transformer layers.
         dropout: Dropout probability.
+        grid_size: Spatial grid size for position encoding.
+        num_temporal: Number of temporal patches.
     """
 
     def __init__(
@@ -45,8 +110,16 @@ class SpatialReasoningModule(nn.Module):
         num_heads: int = 8,
         num_layers: int = 2,
         dropout: float = 0.1,
+        grid_size: int = 16,
+        num_temporal: int = 1,
     ) -> None:
         super().__init__()
+
+        # 2D spatial position encoding for visual tokens
+        self.spatial_pos_enc = SpatialPositionalEncoding(
+            dim=dim, grid_size=grid_size, num_temporal=num_temporal,
+        )
+
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=dim,
             nhead=num_heads,
@@ -62,11 +135,18 @@ class SpatialReasoningModule(nn.Module):
         )
         self.norm = nn.LayerNorm(dim)
 
-    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        visual_tokens: Optional[Tensor] = None,
+        mask: Optional[Tensor] = None,
+    ) -> Tensor:
         """Apply spatial reasoning.
 
         Args:
-            x: [B, S, D] cross-attended features.
+            x: [B, S, D] cross-attended language features.
+            visual_tokens: [B, N, D] original visual tokens (for position injection).
+                If provided, spatial position encoding is added before cross-attention.
             mask: [B, S] optional padding mask.
 
         Returns:
@@ -369,12 +449,14 @@ class LanguageAdapter(nn.Module):
         # Project to visual dim → [B, S, D_visual]
         lang_proj = self.lang_proj(lang_embs)
 
-        # Cross-attention: language queries attend to visual tokens
-        # This is where spatial grounding happens
+        # Add spatial position encoding to visual tokens before cross-attention
+        visual_spatial = self._spatial_reasoning.spatial_pos_enc(visual_tokens)
+
+        # Cross-attention: language queries attend to spatially-encoded visual tokens
         attn_out, _ = self._cross_attn(
             query=lang_proj,
-            key=visual_tokens,
-            value=visual_tokens,
+            key=visual_spatial,
+            value=visual_spatial,
         )  # [B, S, D_visual]
 
         # Residual connection

@@ -32,7 +32,7 @@ from ..flow.geodesic_flow import GeodesicFlowMatcher
 from ..conformal.online_calibration import OnlineConformalCalibrator
 from ..conformal.safe_policy import SafePolicyWrapper
 from .losses import (
-    FlowMatchingLoss,
+    ConformalRegularizer,
     TimestepSampler,
     geodesic_distance_metric,
     compute_action_metrics,
@@ -160,10 +160,16 @@ class VLJEPATrainer:
             device=self.device,
         )
 
-        # Conformal calibrator (wired into validation, not disconnected)
+        # Conformal calibrator (wired into validation AND training)
         self.conformal_calibrator = OnlineConformalCalibrator(
             alpha=config.conformal_alpha,
             safety_radius=config.conformal_safety_radius,
+        ) if config.conformal_enabled else None
+
+        # Conformal regularizer: penalizes training when radius exceeds threshold
+        self.conformal_regularizer = ConformalRegularizer(
+            max_radius=config.conformal_safety_radius,
+            weight=0.1,
         ) if config.conformal_enabled else None
 
         # AMP
@@ -349,6 +355,13 @@ class VLJEPATrainer:
                 timesteps=t,
             )
 
+            # Conformal regularization: penalize if conformal radius is too large
+            conf_reg = torch.tensor(0.0, device=self.device)
+            if self.conformal_regularizer is not None and self.conformal_calibrator is not None:
+                current_radius = self.conformal_calibrator.current_radius()
+                conf_reg = self.conformal_regularizer(pred_vel, target_vel, current_radius)
+                loss = loss + conf_reg
+
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.optimizer)
         grad_norm = nn.utils.clip_grad_norm_(
@@ -359,6 +372,7 @@ class VLJEPATrainer:
 
         return {
             "loss": loss.item(),
+            "conformal_reg": conf_reg.item() if isinstance(conf_reg, Tensor) else conf_reg,
             "grad_norm": grad_norm.item() if isinstance(grad_norm, Tensor) else grad_norm,
             "lr": self.optimizer.param_groups[0]["lr"],
         }

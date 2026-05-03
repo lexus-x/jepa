@@ -4,6 +4,10 @@ Provides:
     - FlowMatchingLoss: Weighted MSE loss for Riemannian flow matching
     - Timestep sampling from Beta distribution
     - Geodesic distance metric for evaluation
+
+NOTE: The task-conditioned metric tensor is now part of GeodesicFlowMatcher
+(TaskConditionedMetric). The loss here is a fallback for when the flow matcher's
+own loss is not used directly.
 """
 
 from __future__ import annotations
@@ -18,18 +22,19 @@ from ..flow.se3_utils import se3_logmap, se3_geodesic_distance, _se3_inverse
 
 
 class FlowMatchingLoss(nn.Module):
-    """Flow matching MSE loss with metric tensor weighting.
+    """Flow matching MSE loss with optional metric tensor weighting.
 
     L = E_{t, x₀, x₁} ‖v_θ(x_t, t, z) - u_t‖²_g
 
-    where g is a diagonal metric tensor weighting rotation and translation
-    components differently.
+    When metric_weights is None (default), uses the task-conditioned metric
+    from GeodesicFlowMatcher instead. This class serves as a standalone
+    fallback or for ablation studies.
 
     Args:
         weight_rot: Metric weight for rotation components (ω ∈ ℝ³).
         weight_trans: Metric weight for translation components (υ ∈ ℝ³).
         loss_type: Loss type - "mse" (default) or "huber".
-        huber_delta: Huber loss delta (only used if loss_type="huber").
+        huber_delta: Huber loss delta.
     """
 
     def __init__(
@@ -56,23 +61,21 @@ class FlowMatchingLoss(nn.Module):
         target: Tensor,
         mask: Optional[Tensor] = None,
     ) -> Tensor:
-        """Compute the flow matching loss.
+        """Compute the flow matching loss with fixed metric weights.
 
         Args:
             predicted: [B, 6] predicted velocities in se(3).
             target: [B, 6] target velocities in se(3).
-            mask: [B] optional sample mask (1 = include, 0 = exclude).
+            mask: [B] optional sample mask.
 
         Returns:
             loss: Scalar loss value.
         """
-        diff = predicted - target  # [B, 6]
-
-        # Apply metric weighting
+        diff = predicted - target
         weighted_diff = diff * self.metric_weights.unsqueeze(0)
 
         if self.loss_type == "mse":
-            per_sample = (weighted_diff ** 2).sum(dim=-1)  # [B]
+            per_sample = (weighted_diff ** 2).sum(dim=-1)
         elif self.loss_type == "huber":
             abs_diff = weighted_diff.abs()
             quadratic = 0.5 * abs_diff ** 2
@@ -90,9 +93,6 @@ class FlowMatchingLoss(nn.Module):
 class TimestepSampler:
     """Timestep sampler using Beta(α, β) distribution.
 
-    The Beta distribution concentrates samples near t=0 and t=1,
-    which are the most informative regions for flow matching training.
-
     Args:
         alpha: Beta distribution α parameter.
         beta: Beta distribution β parameter.
@@ -109,18 +109,10 @@ class TimestepSampler:
         self.device = device
 
     def sample(self, batch_size: int) -> Tensor:
-        """Sample timesteps.
-
-        Args:
-            batch_size: Number of timesteps.
-
-        Returns:
-            t: [B] timesteps in (0, 1).
-        """
+        """Sample timesteps."""
         return self.dist.sample((batch_size,)).to(self.device)
 
     def to(self, device: torch.device) -> "TimestepSampler":
-        """Move sampler to device."""
         self.device = device
         return self
 
@@ -133,27 +125,20 @@ def geodesic_distance_metric(T_pred: Tensor, T_true: Tensor) -> dict[str, Tensor
         T_true: [B, 4, 4] ground truth SE(3) poses.
 
     Returns:
-        metrics: Dictionary with:
-            - "geodesic_total": [B] total geodesic distance
-            - "rotation_error": [B] rotation-only error (radians)
-            - "translation_error": [B] translation-only error (meters)
+        metrics: Dictionary with geodesic_total, rotation_error, translation_error.
     """
-    # Total geodesic distance
-    total_dist = se3_geodesic_distance(T_pred, T_true)  # [B]
+    total_dist = se3_geodesic_distance(T_pred, T_true)
 
-    # Decompose into rotation and translation
     T_pred_inv = _se3_inverse(T_pred)
-    delta = T_pred_inv @ T_true  # [B, 4, 4]
+    delta = T_pred_inv @ T_true
 
-    # Rotation error: angle of the relative rotation
     R_delta = delta[:, :3, :3]
     trace = R_delta[:, 0, 0] + R_delta[:, 1, 1] + R_delta[:, 2, 2]
     cos_angle = ((trace - 1.0) / 2.0).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
-    rot_error = cos_angle.acos()  # [B] in radians
+    rot_error = cos_angle.acos()
 
-    # Translation error: Euclidean norm
     t_delta = delta[:, :3, 3]
-    trans_error = t_delta.norm(dim=-1)  # [B]
+    trans_error = t_delta.norm(dim=-1)
 
     return {
         "geodesic_total": total_dist,

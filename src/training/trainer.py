@@ -6,16 +6,14 @@ Supports:
     - Gradient clipping
     - Checkpoint save/load/resume
     - W&B logging
-    - Validation loop
+    - Validation loop with conformal calibration
     - Cosine LR scheduler with warmup
 """
 
 from __future__ import annotations
 
 import logging
-import os
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -31,6 +29,8 @@ from ..encoder.vjepa2_wrapper import VJEPA2Encoder
 from ..encoder.language_adapter import LanguageAdapter
 from ..flow.velocity_field import VelocityField
 from ..flow.geodesic_flow import GeodesicFlowMatcher
+from ..conformal.online_calibration import OnlineConformalCalibrator
+from ..conformal.safe_policy import SafePolicyWrapper
 from .losses import (
     FlowMatchingLoss,
     TimestepSampler,
@@ -81,11 +81,20 @@ class TrainingConfig:
     hidden_dim: int = 512
     velocity_layers: int = 6
 
+    # Language adapter
+    lang_model_name: str = "sentence-transformers/all-mpnet-base-v2"
+
     # Flow matching
     sigma_min: float = 0.001
     sigma_max: float = 0.5
     beta_alpha: float = 1.5
     beta_beta: float = 1.0
+    task_dim: int = 256
+
+    # Conformal
+    conformal_alpha: float = 0.1
+    conformal_safety_radius: float = 2.0
+    conformal_enabled: bool = True
 
     # DDP
     local_rank: int = -1
@@ -99,7 +108,7 @@ class VLJEPATrainer:
         1. Model construction (encoder, language adapter, velocity field, flow matcher)
         2. Optimizer & scheduler setup
         3. Training loop with AMP + gradient clipping
-        4. Validation loop
+        4. Validation loop with conformal calibration
         5. Checkpoint management
         6. W&B logging
 
@@ -135,13 +144,13 @@ class VLJEPATrainer:
         # Build optimizer & scheduler
         self._build_optimizer()
 
-        # Loss & flow matcher
-        self.loss_fn = FlowMatchingLoss().to(self.device)
+        # Flow matcher (includes task-conditioned metric + learned halting)
         self.flow_matcher = GeodesicFlowMatcher(
             sigma_min=config.sigma_min,
             sigma_max=config.sigma_max,
             beta_alpha=config.beta_alpha,
             beta_beta=config.beta_beta,
+            task_dim=config.visual_dim,  # metric conditioned on visual features
         ).to(self.device)
 
         # Timestep sampler
@@ -150,6 +159,12 @@ class VLJEPATrainer:
             beta=config.beta_beta,
             device=self.device,
         )
+
+        # Conformal calibrator (wired into validation, not disconnected)
+        self.conformal_calibrator = OnlineConformalCalibrator(
+            alpha=config.conformal_alpha,
+            safety_radius=config.conformal_safety_radius,
+        ) if config.conformal_enabled else None
 
         # AMP
         self.use_amp = config.use_amp and torch.cuda.is_available()
@@ -175,12 +190,10 @@ class VLJEPATrainer:
     # ------------------------------------------------------------------
 
     def _setup_ddp(self) -> None:
-        """Initialize distributed training."""
         dist.init_process_group(backend="nccl")
         torch.cuda.set_device(self.local_rank)
 
     def _get_device(self) -> torch.device:
-        """Get the appropriate device."""
         if torch.cuda.is_available():
             if self.distributed:
                 return torch.device(f"cuda:{self.local_rank}")
@@ -188,22 +201,19 @@ class VLJEPATrainer:
         return torch.device("cpu")
 
     def _build_models(self) -> None:
-        """Build encoder, language adapter, and velocity field."""
         cfg = self.config
 
-        # Visual encoder
         self.encoder = VJEPA2Encoder(
             device=self.device,
             freeze=cfg.freeze_encoder,
             unfreeze_last_n=cfg.unfreeze_last_n,
         )
 
-        # Language adapter
         self.language_adapter = LanguageAdapter(
+            lang_model_name=cfg.lang_model_name,
             visual_dim=cfg.visual_dim,
         )
 
-        # Velocity field
         self.velocity_field = VelocityField(
             visual_dim=cfg.visual_dim,
             proprio_dim=cfg.proprio_dim,
@@ -211,7 +221,6 @@ class VLJEPATrainer:
             num_layers=cfg.velocity_layers,
         ).to(self.device)
 
-        # DDP wrap
         if self.distributed:
             self.velocity_field = DDP(
                 self.velocity_field,
@@ -220,33 +229,25 @@ class VLJEPATrainer:
             )
 
     def _build_optimizer(self) -> None:
-        """Build optimizer and cosine LR scheduler with warmup."""
         cfg = self.config
 
-        # Collect trainable parameters
         params = []
         params.extend(self.velocity_field.parameters())
         params.extend(self.language_adapter.parameters())
+        # Flow matcher params (metric net + halting net)
+        params.extend(self.flow_matcher.parameters())
         if not cfg.freeze_encoder or cfg.unfreeze_last_n > 0:
-            params.extend(
-                p for p in self.encoder.parameters() if p.requires_grad
-            )
+            params.extend(p for p in self.encoder.parameters() if p.requires_grad)
 
         self.optimizer = torch.optim.AdamW(
-            params,
-            lr=cfg.lr,
-            weight_decay=cfg.weight_decay,
-            betas=(0.9, 0.95),
+            params, lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
         )
 
-        # Cosine schedule with linear warmup
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.optimizer,
-            lr_scheduler_fn=self._cosine_warmup_schedule,
+            self.optimizer, lr_scheduler_fn=self._cosine_warmup_schedule,
         )
 
     def _cosine_warmup_schedule(self, step: int) -> float:
-        """Cosine decay with linear warmup."""
         cfg = self.config
         if step < cfg.warmup_steps:
             return step / max(cfg.warmup_steps, 1)
@@ -254,7 +255,6 @@ class VLJEPATrainer:
         return 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.14159)).item())
 
     def _setup_wandb(self) -> None:
-        """Initialize W&B logging."""
         try:
             import wandb
             self._wandb_run = wandb.init(
@@ -271,18 +271,11 @@ class VLJEPATrainer:
     # ------------------------------------------------------------------
 
     def train(self) -> dict[str, float]:
-        """Run the full training loop.
-
-        Returns:
-            metrics: Final training metrics.
-        """
         cfg = self.config
 
-        # Build data loaders
         train_loader = self._make_loader(self.train_dataset, shuffle=True)
         val_loader = self._make_loader(self.val_dataset, shuffle=False) if self.val_dataset else None
 
-        # Set models to train mode
         self.velocity_field.train()
         self.language_adapter.train()
         if not cfg.freeze_encoder or cfg.unfreeze_last_n > 0:
@@ -305,11 +298,9 @@ class VLJEPATrainer:
                 self.global_step += 1
                 self.scheduler.step()
 
-                # Logging
                 if self.global_step % cfg.log_interval == 0 and self.is_main:
                     self._log_metrics(metrics, "train")
 
-                # Validation
                 if val_loader and self.global_step % cfg.eval_interval == 0:
                     val_metrics = self._validate(val_loader)
                     if self.is_main:
@@ -318,29 +309,15 @@ class VLJEPATrainer:
                             self.best_val_loss = val_metrics["loss"]
                             self._save_checkpoint("best")
 
-                # Checkpoint
                 if self.global_step % cfg.save_interval == 0 and self.is_main:
                     self._save_checkpoint(f"step_{self.global_step}")
 
-        # Final save
         if self.is_main:
             self._save_checkpoint("final")
 
         return metrics
 
     def _train_step(self, batch: dict) -> dict[str, float]:
-        """Execute a single training step.
-
-        Args:
-            batch: Dictionary with keys:
-                - "images": [B, 3, T, H, W] RGB frames
-                - "instructions": list of B text strings
-                - "actions": [B, 4, 4] SE(3) action poses
-                - "proprioception": [B, D_proprio] proprioceptive state
-
-        Returns:
-            metrics: Dictionary of scalar metrics.
-        """
         cfg = self.config
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -352,21 +329,16 @@ class VLJEPATrainer:
             proprio = proprio.to(self.device)
 
         with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-            # Encode visual features
             with torch.no_grad() if cfg.freeze_encoder and cfg.unfreeze_last_n == 0 else torch.enable_grad():
-                visual_tokens = self.encoder(images)  # [B, N, D]
-                visual_features = visual_tokens.mean(dim=1)  # [B, D]
+                visual_tokens = self.encoder(images)
+                visual_features = visual_tokens.mean(dim=1)
 
-            # Language conditioning
             lang_features = self.language_adapter(instructions, visual_tokens, self.device)
+            conditioning = visual_features + lang_features
 
-            # Fuse: add language to visual
-            conditioning = visual_features + lang_features  # [B, D]
-
-            # Sample timesteps
             t = self.timestep_sampler.sample(actions.shape[0])
 
-            # Flow matching forward
+            # Flow matching with task-conditioned metric
             loss, pred_vel, target_vel = self.flow_matcher(
                 data_poses=actions,
                 velocity_field=lambda x_t, t_val, **kw: self.velocity_field(
@@ -377,15 +349,11 @@ class VLJEPATrainer:
                 timesteps=t,
             )
 
-        # Backward
         self.scaler.scale(loss).backward()
-
-        # Gradient clipping
         self.scaler.unscale_(self.optimizer)
         grad_norm = nn.utils.clip_grad_norm_(
             self._trainable_params(), cfg.grad_clip_norm
         )
-
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
@@ -397,19 +365,19 @@ class VLJEPATrainer:
 
     @torch.no_grad()
     def _validate(self, val_loader: DataLoader) -> dict[str, float]:
-        """Run validation loop.
+        """Validation loop with conformal calibration.
 
-        Args:
-            val_loader: Validation data loader.
-
-        Returns:
-            metrics: Aggregated validation metrics.
+        After computing validation loss, also updates the conformal calibrator
+        with predicted vs ground truth actions.
         """
         cfg = self.config
         self.velocity_field.eval()
 
         total_loss = 0.0
         num_batches = 0
+        total_geo_dist = 0.0
+        conformal_covered = 0
+        conformal_total = 0
 
         for batch in val_loader:
             images = batch["images"].to(self.device)
@@ -426,7 +394,7 @@ class VLJEPATrainer:
                 conditioning = visual_features + lang_features
 
                 t = self.timestep_sampler.sample(actions.shape[0])
-                loss, _, _ = self.flow_matcher(
+                loss, pred_vel, target_vel = self.flow_matcher(
                     data_poses=actions,
                     velocity_field=lambda x_t, t_val, **kw: self.velocity_field(
                         x_t, t_val, conditioning, proprio
@@ -439,26 +407,54 @@ class VLJEPATrainer:
             total_loss += loss.item()
             num_batches += 1
 
+            # Conformal calibration: update with predicted vs true actions
+            if self.conformal_calibrator is not None:
+                # Generate predicted actions via Euler integration (fast)
+                noise = self.flow_matcher.sample_noise(actions)
+                pred_actions = self.flow_matcher.euler_integrate(
+                    velocity_fn=lambda x_t, t_val: self.velocity_field(
+                        x_t, t_val, conditioning, proprio
+                    ),
+                    noise_poses=noise,
+                    num_steps=10,
+                )
+                cal_info = self.conformal_calibrator.update(pred_actions, actions)
+                conformal_covered += cal_info["covered"].sum().item()
+                conformal_total += actions.shape[0]
+
+                # Geodesic distance
+                geo_dist = geodesic_distance_metric(pred_actions, actions)
+                total_geo_dist += geo_dist["geodesic_total"].mean().item()
+
         self.velocity_field.train()
 
         avg_loss = total_loss / max(num_batches, 1)
-        return {"loss": avg_loss}
+        metrics = {"loss": avg_loss}
+
+        if num_batches > 0:
+            metrics["geodesic_distance"] = total_geo_dist / num_batches
+
+        if self.conformal_calibrator is not None and conformal_total > 0:
+            metrics["conformal_coverage"] = conformal_covered / conformal_total
+            metrics["conformal_radius"] = self.conformal_calibrator.current_radius()
+            metrics["conformal_alpha"] = self.conformal_calibrator.alpha_current
+            if self.conformal_calibrator.is_halted:
+                logger.warning(
+                    "Conformal calibrator halted: %s",
+                    self.conformal_calibrator.halt_reason,
+                )
+
+        return metrics
 
     # ------------------------------------------------------------------
     # Checkpointing
     # ------------------------------------------------------------------
 
     def _save_checkpoint(self, tag: str) -> None:
-        """Save training checkpoint.
-
-        Args:
-            tag: Checkpoint identifier (e.g., "best", "step_5000", "final").
-        """
         ckpt_dir = Path(self.config.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         path = ckpt_dir / f"checkpoint_{tag}.pt"
 
-        # Unwrap DDP
         velocity_state = (
             self.velocity_field.module.state_dict()
             if isinstance(self.velocity_field, DDP)
@@ -471,13 +467,16 @@ class VLJEPATrainer:
             "best_val_loss": self.best_val_loss,
             "velocity_field": velocity_state,
             "language_adapter": self.language_adapter.state_dict(),
+            "flow_matcher": self.flow_matcher.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
             "scaler": self.scaler.state_dict(),
             "config": vars(self.config),
         }
 
-        # Optionally save encoder (if fine-tuning)
+        if self.conformal_calibrator is not None:
+            state["conformal_calibrator"] = self.conformal_calibrator.state_dict()
+
         if not self.config.freeze_encoder or self.config.unfreeze_last_n > 0:
             state["encoder"] = self.encoder.state_dict()
 
@@ -485,11 +484,6 @@ class VLJEPATrainer:
         logger.info("Saved checkpoint: %s", path)
 
     def _load_checkpoint(self, path: str) -> None:
-        """Load training checkpoint.
-
-        Args:
-            path: Path to checkpoint file.
-        """
         logger.info("Loading checkpoint: %s", path)
         state = torch.load(path, map_location=self.device)
 
@@ -497,7 +491,6 @@ class VLJEPATrainer:
         self.epoch = state["epoch"]
         self.best_val_loss = state["best_val_loss"]
 
-        # Load model weights
         vf = (
             self.velocity_field.module
             if isinstance(self.velocity_field, DDP)
@@ -506,10 +499,15 @@ class VLJEPATrainer:
         vf.load_state_dict(state["velocity_field"])
         self.language_adapter.load_state_dict(state["language_adapter"])
 
+        if "flow_matcher" in state:
+            self.flow_matcher.load_state_dict(state["flow_matcher"])
+
+        if "conformal_calibrator" in state and self.conformal_calibrator is not None:
+            self.conformal_calibrator.load_state_dict(state["conformal_calibrator"])
+
         if "encoder" in state:
             self.encoder.load_state_dict(state["encoder"])
 
-        # Load optimizer & scheduler
         self.optimizer.load_state_dict(state["optimizer"])
         self.scheduler.load_state_dict(state["scheduler"])
         if "scaler" in state:
@@ -521,39 +519,27 @@ class VLJEPATrainer:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _make_loader(
-        self,
-        dataset: Optional[Any],
-        shuffle: bool,
-    ) -> Optional[DataLoader]:
-        """Build a DataLoader with optional DDP sampler."""
+    def _make_loader(self, dataset: Optional[Any], shuffle: bool) -> Optional[DataLoader]:
         if dataset is None:
             return None
-
         sampler = None
         if self.distributed:
             sampler = DistributedSampler(dataset, shuffle=shuffle)
             shuffle = False
-
         return DataLoader(
-            dataset,
-            batch_size=self.config.batch_size,
-            shuffle=shuffle,
-            sampler=sampler,
-            num_workers=self.config.num_workers,
-            pin_memory=self.config.pin_memory,
-            drop_last=True,
+            dataset, batch_size=self.config.batch_size, shuffle=shuffle,
+            sampler=sampler, num_workers=self.config.num_workers,
+            pin_memory=self.config.pin_memory, drop_last=True,
         )
 
     def _trainable_params(self) -> list[nn.Parameter]:
-        """Collect all trainable parameters."""
         params = list(self.velocity_field.parameters())
         params.extend(self.language_adapter.parameters())
+        params.extend(self.flow_matcher.parameters())
         params.extend(p for p in self.encoder.parameters() if p.requires_grad)
         return params
 
     def _log_metrics(self, metrics: dict[str, float], prefix: str) -> None:
-        """Log metrics to console and W&B."""
         step = self.global_step
         msg_parts = [f"step={step}"]
         for k, v in metrics.items():
@@ -562,13 +548,9 @@ class VLJEPATrainer:
 
         if self._wandb_run is not None:
             import wandb
-            wandb.log(
-                {f"{prefix}/{k}": v for k, v in metrics.items()},
-                step=step,
-            )
+            wandb.log({f"{prefix}/{k}": v for k, v in metrics.items()}, step=step)
 
     def cleanup(self) -> None:
-        """Cleanup distributed training resources."""
         if self.distributed:
             dist.destroy_process_group()
         if self._wandb_run is not None:

@@ -7,6 +7,7 @@ Neural network that predicts tangent vectors in se(3) conditioned on:
     - Proprioceptive state (joint angles, gripper state, etc.)
 
 Architecture: MLP with sinusoidal time embedding and FiLM conditioning.
+Also outputs a local curvature estimate used by the adaptive ODE integrator.
 """
 
 from __future__ import annotations
@@ -18,8 +19,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-
-from .se3_utils import se3_logmap
 
 
 # ======================================================================
@@ -40,7 +39,6 @@ class SinusoidalTimeEmbedding(nn.Module):
         assert dim % 2 == 0, "dim must be even"
         self.dim = dim
         half_dim = dim // 2
-        # Frequency bands: exp(-log(10000) * i / (half_dim - 1))
         freqs = torch.exp(
             -math.log(10000.0) * torch.arange(half_dim, dtype=torch.float32) / (half_dim - 1)
         )
@@ -55,11 +53,8 @@ class SinusoidalTimeEmbedding(nn.Module):
         Returns:
             emb: [B, dim] sinusoidal embeddings.
         """
-        # t: [B] → [B, 1]
         t = t.unsqueeze(-1)
-        # [B, half_dim]
         args = t * self.freqs.unsqueeze(0)
-        # [B, dim]
         return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
 
 
@@ -82,25 +77,14 @@ class FiLMBlock(nn.Module):
         super().__init__()
         self.scale_proj = nn.Linear(cond_dim, in_dim)
         self.shift_proj = nn.Linear(cond_dim, in_dim)
-        # Initialize scale to 1 and shift to 0
         nn.init.ones_(self.scale_proj.weight)
         nn.init.zeros_(self.scale_proj.bias)
         nn.init.zeros_(self.shift_proj.weight)
         nn.init.zeros_(self.shift_proj.bias)
 
     def forward(self, x: Tensor, cond: Tensor) -> Tensor:
-        """Apply FiLM modulation.
-
-        Args:
-            x: [B, in_dim] features.
-            cond: [B, cond_dim] conditioning.
-
-        Returns:
-            y: [B, in_dim] modulated features.
-        """
-        scale = self.scale_proj(cond)
-        shift = self.shift_proj(cond)
-        return scale * x + shift
+        """Apply FiLM modulation."""
+        return self.scale_proj(cond) * x + self.shift_proj(cond)
 
 
 # ======================================================================
@@ -110,10 +94,8 @@ class FiLMBlock(nn.Module):
 class SE3PoseEncoder(nn.Module):
     """Encode a 4×4 SE(3) matrix into a compact vector.
 
-    Extracts:
-        - Rotation: 6D continuous rotation representation (first two columns)
-        - Translation: 3D vector
-    Total: 9D
+    Uses 6D continuous rotation representation (first two columns of R)
+    plus translation, projected through an MLP.
 
     Args:
         output_dim: Output embedding dimension.
@@ -136,12 +118,10 @@ class SE3PoseEncoder(nn.Module):
         Returns:
             z: [B, output_dim] pose embeddings.
         """
-        R = T[:, :3, :3]  # [B, 3, 3]
-        t = T[:, :3, 3]  # [B, 3]
-
-        # 6D rotation: first two columns of R
-        rot_6d = R[:, :, :2].reshape(-1, 6)  # [B, 6]
-        pose_vec = torch.cat([rot_6d, t], dim=-1)  # [B, 9]
+        R = T[:, :3, :3]
+        t = T[:, :3, 3]
+        rot_6d = R[:, :, :2].reshape(-1, 6)
+        pose_vec = torch.cat([rot_6d, t], dim=-1)
         return self.mlp(pose_vec)
 
 
@@ -157,6 +137,7 @@ class VelocityField(nn.Module):
         2. Encode timestep → time_emb (sinusoidal)
         3. Fuse visual + proprioceptive features → cond_emb
         4. MLP with FiLM conditioning → 6D velocity in se(3)
+        5. Auxiliary head: local curvature estimate for adaptive ODE
 
     Args:
         visual_dim: Dimension of visual features (1024 for V-JEPA 2).
@@ -181,10 +162,9 @@ class VelocityField(nn.Module):
         super().__init__()
 
         self.pose_encoder = SE3PoseEncoder(pose_emb_dim)
-
         self.time_embedding = SinusoidalTimeEmbedding(time_emb_dim)
 
-        # Conditioning fusion: visual + proprio → cond_dim
+        # Conditioning fusion
         self.proprio_proj = nn.Linear(proprio_dim, 128)
         self.visual_proj = nn.Linear(visual_dim, 256)
         self.cond_fusion = nn.Sequential(
@@ -195,10 +175,9 @@ class VelocityField(nn.Module):
 
         # Input: pose_emb + time_emb
         input_dim = pose_emb_dim + time_emb_dim
-
-        # Build MLP with FiLM conditioning
         self.input_proj = nn.Linear(input_dim, hidden_dim)
 
+        # MLP blocks with FiLM
         self.blocks = nn.ModuleList()
         self.film_blocks = nn.ModuleList()
         self.norms = nn.ModuleList()
@@ -214,16 +193,27 @@ class VelocityField(nn.Module):
             self.film_blocks.append(FiLMBlock(hidden_dim, hidden_dim))
             self.norms.append(nn.LayerNorm(hidden_dim))
 
-        # Output head: 6D se(3) velocity
+        # Primary output: 6D se(3) velocity
         self.output_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 6),
         )
 
+        # Auxiliary output: local curvature estimate (scalar)
+        # Used by the adaptive ODE integrator to adjust step sizes
+        self.curvature_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 4),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 4, 1),
+            nn.Softplus(),  # Curvature is non-negative
+        )
+
         # Initialize output head with small weights for stable training
         nn.init.zeros_(self.output_head[-1].weight)
         nn.init.zeros_(self.output_head[-1].bias)
+        nn.init.zeros_(self.curvature_head[-2].weight)
+        nn.init.constant_(self.curvature_head[-2].bias, -1.0)  # Low initial curvature
 
     def forward(
         self,
@@ -239,43 +229,67 @@ class VelocityField(nn.Module):
             t: [B] timesteps in (0, 1).
             visual_features: [B, D_visual] visual conditioning.
             proprioception: [B, D_proprio] proprioceptive state.
-                If None, uses zeros.
 
         Returns:
             v: [B, 6] velocity in se(3).
         """
+        h = self._encode(x_t, t, visual_features, proprioception)
+        return self.output_head(h)
+
+    def forward_with_curvature(
+        self,
+        x_t: Tensor,
+        t: Tensor,
+        visual_features: Tensor,
+        proprioception: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Predict velocity AND local curvature estimate.
+
+        Args:
+            x_t: [B, 4, 4] current SE(3) poses.
+            t: [B] timesteps in (0, 1).
+            visual_features: [B, D_visual] visual conditioning.
+            proprioception: [B, D_proprio] proprioceptive state.
+
+        Returns:
+            v: [B, 6] velocity in se(3).
+            curvature: [B, 1] local curvature estimate (positive scalar).
+        """
+        h = self._encode(x_t, t, visual_features, proprioception)
+        return self.output_head(h), self.curvature_head(h)
+
+    def _encode(
+        self,
+        x_t: Tensor,
+        t: Tensor,
+        visual_features: Tensor,
+        proprioception: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Compute shared hidden representation.
+
+        Returns:
+            h: [B, hidden_dim] hidden features.
+        """
         B = x_t.shape[0]
-        device = x_t.device
-        dtype = x_t.dtype
+        device, dtype = x_t.device, x_t.dtype
 
-        # Encode pose
-        pose_emb = self.pose_encoder(x_t)  # [B, pose_emb_dim]
+        pose_emb = self.pose_encoder(x_t)
+        time_emb = self.time_embedding(t)
 
-        # Encode time
-        time_emb = self.time_embedding(t)  # [B, time_emb_dim]
-
-        # Build conditioning
-        visual_cond = self.visual_proj(visual_features)  # [B, 256]
-
+        visual_cond = self.visual_proj(visual_features)
         if proprioception is None:
             proprioception = torch.zeros(B, 7, device=device, dtype=dtype)
-        proprio_cond = self.proprio_proj(proprioception)  # [B, 128]
+        proprio_cond = self.proprio_proj(proprioception)
 
-        cond = self.cond_fusion(torch.cat([visual_cond, proprio_cond], dim=-1))  # [B, hidden_dim]
+        cond = self.cond_fusion(torch.cat([visual_cond, proprio_cond], dim=-1))
+        h = self.input_proj(torch.cat([pose_emb, time_emb], dim=-1))
 
-        # Input
-        h = self.input_proj(torch.cat([pose_emb, time_emb], dim=-1))  # [B, hidden_dim]
-
-        # MLP blocks with FiLM
         for block, film, norm in zip(self.blocks, self.film_blocks, self.norms):
-            h = h + block(h)  # Residual
+            h = h + block(h)
             h = norm(h)
-            h = film(h, cond)  # FiLM conditioning
+            h = film(h, cond)
 
-        # Output
-        v = self.output_head(h)  # [B, 6]
-
-        return v
+        return h
 
     def num_parameters(self, trainable_only: bool = True) -> int:
         """Count parameters."""

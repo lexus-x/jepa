@@ -11,14 +11,16 @@ encoder:
   unfreeze_last_n: 2
 
 # Language adapter
+# Upgraded from all-MiniLM-L6-v2 (22M) to all-mpnet-base-v2 (109M)
+# For complex spatial reasoning, consider: Qwen/Qwen2.5-1.5B-Instruct
 language_adapter:
-  model_name: all-MiniLM-L6-v2
+  model_name: sentence-transformers/all-mpnet-base-v2
   visual_dim: 1024
-  hidden_dim: 512
-  num_layers: 3
-  dropout: 0.1
-  use_cross_attention: false
+  hidden_dim: 768
   num_cross_heads: 8
+  num_spatial_layers: 2
+  dropout: 0.1
+  max_seq_len: 128
 
 # Velocity field network
 velocity_field:
@@ -30,17 +32,26 @@ velocity_field:
   num_layers: 6
   dropout: 0.1
 
-# Flow matching
+# Flow matching (includes task-conditioned metric + learned halting)
 flow_matching:
   sigma_min: 0.001
   sigma_max: 0.5
   beta_alpha: 1.5
   beta_beta: 1.0
-  metric_weight_rot: 1.0
-  metric_weight_trans: 1.0
+  task_dim: 1024  # metric conditioned on visual features
+
+# Conformal safety (wired into validation and deployment)
+conformal:
+  enabled: true
+  alpha: 0.1  # 90% coverage target
+  safety_radius: 2.0  # max radius before fallback
+  eta: 0.005  # Gibbs-Candès learning rate
+  decay: 0.995  # exponential decay for old scores
 
 # Inference
 inference:
-  method: rk4  # "euler" or "rk4"
-  num_steps: 20
-  num_samples: 1  # For multi-sample inference
+  method: adaptive  # "adaptive", "euler", or "rk4"
+  num_steps: 20  # only for euler/rk4
+  atol: 1.0e-3  # adaptive ODE absolute tolerance
+  rtol: 1.0e-2  # adaptive ODE relative tolerance
+  max_steps: 200  # adaptive ODE max steps

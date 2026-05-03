@@ -11,7 +11,7 @@ defaults:
 project:
   name: vl-jepa
   description: "Vision-Language Joint Embedding Predictive Architecture for Robotic Manipulation"
-  version: "0.1.0"
+  version: "0.2.0"
 
 # Global settings
 seed: 42

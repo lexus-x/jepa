@@ -2,5 +2,6 @@
 
 from .libero_eval import LIBEROEvaluator
 from .metaworld_eval import MetaWorldEvaluator
+from .comparison import SAFEComparison
 
-__all__ = ["LIBEROEvaluator", "MetaWorldEvaluator"]
+__all__ = ["LIBEROEvaluator", "MetaWorldEvaluator", "SAFEComparison"]

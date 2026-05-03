@@ -1,210 +1,200 @@
-# VL-JEPA Architecture Notes
+# SE(3) Conformal Prediction for Safe Robot Policies
 
-## Design Philosophy
+## Problem
 
-VL-JEPA is built on a single thesis: **better mathematical modeling beats more parameters**.
+Learned robot policies (VLAs) fail silently.  When a policy makes a mistake,
+there's no built-in mechanism to detect the failure or provide a safe fallback.
+Existing approaches (SAFE, confidence thresholds) reduce failure detection to
+a **scalar** — a single number that tells you *something* is wrong, but not
+*what* or *where*.
 
-While existing VLAs scale to 7B+ parameters with brute-force VLM backbones, VL-JEPA aims to
-achieve competitive performance with <500M parameters by respecting the geometric structure
-of robot actions.
+## Approach
 
-**Status**: This is a research framework. Core claims below are hypotheses backed by
-theoretical motivation, not empirical results. See "Open Questions" for what remains untested.
-
-## Why V-JEPA 2 (Dynamics > Semantics)
-
-| Feature | VLMs (PaliGemma, LLaVA) | V-JEPA 2 |
-|---------|------------------------|----------|
-| Pretraining | Language-image alignment | Video dynamics prediction |
-| Learns | "What objects are" | "What will happen next" |
-| Output | CLS token or sparse tokens | Dense per-patch features (256/frame) |
-| Action relevance | Indirect (semantic → action) | Direct (dynamics → action) |
-
-V-JEPA 2 was pretrained on 1M+ hours of internet video to predict masked spatiotemporal regions
-in latent space. This produces representations that encode:
-- Object trajectories (what's moving, how fast, in what direction)
-- Causal structure (pushing here causes that to move)
-- Temporal dynamics (what happens next)
-
-**Hypothesis**: For action generation, dynamics representations are more useful than semantic
-representations. This has not been validated end-to-end — see "Open Questions".
-
-## Why SE(3) Flow Matching (Geometry Matters)
-
-Robot end-effector poses live on the SE(3) manifold, not in flat Euclidean space. Predicting
-actions in R⁷ introduces rotational artifacts (e.g., averaging two valid rotations can produce
-an invalid one).
-
-**SE(3) = SO(3) ⋉ ℝ³** (semidirect product of rotations and translations)
-
-VL-JEPA generates actions as geodesics on SE(3) via Riemannian flow matching:
-- **Training**: Conditional Flow Matching with geodesic interpolation
-  `γ(t) = exp(t · log(T₁T₀⁻¹))T₀`
-- **Inference**: Adaptive ODE integration from noise to action on the manifold
-- **Benefit**: No rotational artifacts, physically plausible trajectories
-
-### Task-Conditioned Metric Tensor
-
-The metric tensor g_ij(z) is **learned and conditioned on the task embedding** (fused visual +
-language features), not a fixed diagonal:
+We wrap any VLA with **conformal prediction on SE(3)**, the manifold of rigid
+body transformations.  Instead of a scalar failure score, we produce a
+**geodesic ball prediction set**:
 
 ```
-g(z) = diag(softplus(Wz + b))  ∈ ℝ^{6×6}
+C_α = {T ∈ SE(3) : d_geo(T_pred, T) ≤ q̂_{1-α}}
 ```
 
-This lets the loss landscape adapt per-task:
-- Insertion tasks: upweight translational precision near contact
-- Free-space motion: uniform metric (geodesic is nearly straight)
-- Rotation-heavy tasks: upweight rotational components
+This provides:
 
-## Why Adaptive Neural ODE (Computation = Complexity)
+| Property | SAFE (scalar) | SE(3) Conformal |
+|----------|--------------|-----------------|
+| Output | P(failure) ∈ [0,1] | Ball in SE(3) with radius r |
+| Geometry | None | Rotation vs translation breakdown |
+| Guarantee | Heuristic | P(T_true ∈ C_α) ≥ 1-α (distribution-free) |
+| Adaptation | Fixed threshold | Gibbs-Candès online update |
+| Set shape | Scalar threshold | Geodesic ball (task-conditioned) |
 
-Existing VLAs use fixed computation per action — same FLOPs for "move straight" and
-"insert peg while rotating." This either under-computes hard tasks or wastes compute on easy ones.
-
-VL-JEPA uses an adaptive ODE integrator (Dormand-Prince RK45) with:
-
-1. **Embedded error estimation**: 5th/4th order pair gives local error estimate per step
-2. **PI controller**: adjusts dt based on error ratio, clamped to [dt_min, dt_max]
-3. **Curvature-based halting**: stops when velocity norm and curvature drop below threshold
-4. **Learned halting** (ponder-net style): auxiliary head predicts halting probability per step
-
-This is not just a fixed step count with a fancy name — it's actual adaptive integration.
-
-**Runtime behavior** (expected, not measured):
-- Easy actions (free-space motion): 5-10 ODE steps
-- Hard actions (contact-rich): 20-50 ODE steps
-- Mathematical motivation: N = O(κ(M)/ε) where κ is sectional curvature
-
-## Why Conformal Prediction (Provable Safety)
-
-Existing VLAs have no mechanism to detect when they're failing. VL-JEPA provides
-distribution-free safety guarantees via conformal prediction on SE(3):
-
-- **Nonconformity score**: `s(T_pred, T_true) = ‖log(T_pred⁻¹ T_true)‖` (geodesic distance)
-- **Prediction set**: `C_α = {T ∈ SE(3) : d_geo(T_pred, T) ≤ q̂_{1-α}}`
-- **Guarantee**: `P(T_true ∈ C_α) ≥ 1 - α` (no distributional assumptions)
-- **Online adaptation**: Gibbs-Candès update for non-stationary environments
-- **Safety halt**: When conformal radius exceeds threshold → fallback to conservative action
-
-### Deployment Integration
-
-The `SafePolicyWrapper` wires conformal prediction into the actual control loop:
+## Architecture
 
 ```
-action = safe_policy.act(images, instruction, proprio, encoder)
-# Internally: policy predicts → calibrator checks radius → fallback if unsafe
+┌─────────────┐
+│  Any VLA    │  OpenVLA, π₀, JEPA-VLA, ...
+│  (frozen)   │
+└──────┬──────┘
+       │ T_pred ∈ SE(3)
+       ▼
+┌──────────────────────────────────────────┐
+│         SafePolicyWrapper                │
+│                                          │
+│  ┌─────────────┐  ┌───────────────────┐  │
+│  │ LieScorer   │  │ OnlineConformal   │  │
+│  │             │──│ Calibrator        │  │
+│  │ s(T,T') =   │  │                   │  │
+│  │ ‖log(T⁻¹T')‖│  │ α_{t+1} = α_t +  │  │
+│  │             │  │ η(α - 𝟙[missed])  │  │
+│  └─────────────┘  └───────────────────┘  │
+│          │                │               │
+│          ▼                ▼               │
+│     ┌─────────────────────────┐          │
+│     │  if r > r_max → fallback│          │
+│     │  if halted   → fallback │          │
+│     │  else        → T_pred   │          │
+│     └─────────────────────────┘          │
+└──────────────────────────────────────────┘
 ```
 
-When ground truth is available, the calibrator updates online:
+## Components
+
+### LieScorer (`src/conformal/lie_scorer.py`)
+
+Computes nonconformity scores on SE(3):
+
 ```
-info = safe_policy.update(predicted_action, true_action)
-# Returns: scores, coverage, radius, whether fallback was needed
+s(T_pred, T_true) = ‖log(T_pred⁻¹ T_true)‖_g
 ```
 
-## Open Questions (Untested Claims)
+where g is a weighted norm (configurable rotation/translation weights).
+Also provides:
+- Geodesic ball prediction sets
+- Per-axis error breakdown (rotation vs translation)
+- Calibration on held-out trajectories
 
-The following are **hypotheses** that require experimental validation. They are not
-claimed as facts.
+### OnlineConformalCalibrator (`src/conformal/online_calibration.py`)
 
-### 1. JEPA vs VLM for action prediction
+Gibbs-Candès adaptive conformal prediction:
 
-**Claim**: V-JEPA 2 features outperform VLM features (CLIP, DINOv2, PaliGemma) for SE(3) action
-generation.
+```
+α_{t+1} = α_t + η(α - 𝟙[s_t > q̂_t])
+```
 
-**What's needed**:
-- Controlled experiment: same flow matching head, same training data, different encoders
-- Benchmarks: LIBERO (all 4 suites), MetaWorld MT10/MT50
-- Metrics: success rate, geodesic error, sample efficiency
+Features:
+- Exponentially decaying weights for old scores (handles drift)
+- Streaming quantile estimation (no full history needed)
+- Safety halt when radius exceeds threshold
+- Serializable state for checkpointing
 
-**Status**: Not run. The codebase has the infrastructure to run this comparison, but no
-results exist.
+### SafePolicyWrapper (`src/conformal/safe_policy.py`)
 
-### 2. Task-conditioned metric vs fixed metric
+Wraps any `BasePolicy` with conformal safety:
+1. Calls `policy.predict_action(observation, instruction)`
+2. Checks conformal radius against threshold
+3. Falls back to identity (no movement) if unsafe
+4. Tracks coverage, radius, and intervention statistics
 
-**Claim**: A learned, task-conditioned metric tensor outperforms a fixed bi-invariant metric.
+### Policy Adapters (`src/policies/`)
 
-**What's needed**:
-- Ablation: fixed [1,1,1,1,1,1] vs learned g(z)
-- Measure: loss convergence speed, final success rate per task type
+Drop-in adapters for existing VLAs:
+- `OpenVLAPolicy`: Wraps OpenVLA (7D → SE(3))
+- `PiZeroPolicy`: Wraps π₀ (action chunk → SE(3))
+- `JEPAPolicy`: Wraps JEPA-VLA (native SE(3))
+- `RandomPolicy`: Baseline for testing
 
-**Status**: Not run.
+## Key Hypotheses (To Be Tested)
 
-### 3. Adaptive ODE vs fixed-step integration
+### H1: SE(3) conformal sets are tighter than scalar detectors
 
-**Claim**: Adaptive-step integration outperforms fixed-step (Euler/RK4) at equal or less compute.
+**Claim**: For the same coverage level (1-α), SE(3) geodesic ball prediction
+sets are smaller (in volume) than the equivalent scalar threshold region.
 
-**What's needed**:
-- Ablation: adaptive vs Euler-10 vs Euler-20 vs RK4-10
-- Measure: success rate vs total FLOPs, latency distribution
+**Why this might be true**: The geodesic ball respects the manifold structure.
+A scalar detector in R⁷ wastes volume on rotations that are physically
+impossible (e.g., the "average" of two valid rotations may be invalid).
 
-**Status**: Not run.
+**Experiment**: Compare `conformal_set_size` (r⁶) vs `safe_set_size` (scalar
+threshold) at matched coverage rates.
 
-### 4. Conformal safety in closed-loop control
+### H2: Adaptive ODE steps correlate with conformal radius
 
-**Claim**: Conformal prediction sets provide valid coverage in closed-loop robotic control.
+**Claim**: When the adaptive ODE integrator takes more steps (higher task
+complexity), the conformal radius is larger (more uncertainty).
 
-**What's needed**:
-- Coverage test: does the empirical coverage match 1-α?
-- Safety test: does the fallback mechanism prevent dangerous actions?
-- Distribution shift test: does the Gibbs-Candès adaptation handle domain shift?
+**Why this might be true**: More ODE steps = higher curvature = the flow
+is harder to integrate = the model is less certain = larger prediction set.
 
-**Status**: Not run.
+**Experiment**: Correlate ODE step count with conformal radius across tasks.
 
-## Ablation Study Design (Pending Experiments)
+### H3: Gibbs-Candès adaptation handles distribution shift
 
-The following ablations should be run to validate the architecture. **No results exist yet.**
+**Claim**: The online calibrator maintains valid coverage when the test
+distribution differs from calibration (e.g., new objects, new scenes).
 
-| Ablation | What's removed | Hypothesis | Status |
-|----------|---------------|------------|--------|
-| VL-JEPA (full) | — | — | Pending |
-| w/o task-conditioned metric | Fixed bi-invariant SE(3) metric | Harder tasks benefit from adaptive metric | Not run |
-| w/o adaptive ODE | Fixed 10 steps (Euler) | Adaptive uses less compute on easy tasks | Not run |
-| w/o conformal | No safety sets | Same accuracy, but no safety guarantees | Not run |
-| VLM encoder (ablation) | Replace V-JEPA 2 with DINOv2/CLIP | V-JEPA dynamics features help action prediction | Not run |
-| w/ Euclidean actions | Predict in R⁷, not SE(3) | SE(3) helps on contact-rich tasks | Not run |
-| w/ 300M only (no flow head) | Linear probe on V-JEPA 2 | Flow matching is necessary | Not run |
+**Why this might be true**: Gibbs-Candès updates α_t based on recent
+coverage feedback, so it adapts to shifting distributions.
 
-**To run these ablations**, use:
+**Experiment**: Evaluate on out-of-distribution tasks, measure coverage
+over time.
+
+## Benchmark Protocol
+
+### Metrics
+
+1. **Coverage rate**: Fraction of true actions inside C_α (target: ≥ 1-α)
+2. **Conformal radius**: Mean and std of prediction set radius
+3. **Safety intervention rate**: Fraction of steps using fallback
+4. **Localization**: Rotation vs translation error breakdown
+5. **Adaptation speed**: Steps to reach target coverage after shift
+
+### Baselines
+
+1. **SAFE** (scalar failure detector): Train MLP on se(3) features
+2. **No safety**: Raw VLA without any safety wrapper
+3. **Fixed threshold**: Conformal with fixed (non-adaptive) calibration
+
+### Benchmarks
+
+1. **LIBERO**: 4 suites (Spatial, Object, Goal, Long) × 10 tasks
+2. **MetaWorld**: MT10, MT50
+3. **Distribution shift**: Train on LIBERO-Spatial, test on LIBERO-Long
+
+## Running
+
 ```bash
-# Full model
-./scripts/train.sh --config=configs/config.yaml
+# Random policy baseline (no VLA needed)
+./scripts/eval.sh --policy=random --all
 
-# Ablation: fixed metric
-./scripts/train.sh --config=configs/config.yaml \
-    model.flow_matching.task_dim=0
+# OpenVLA with conformal safety
+./scripts/eval.sh --policy=openvla --suite=libero_spatial
 
-# Ablation: fixed-step ODE
-./scripts/eval.sh --checkpoint=checkpoints/best.pt \
-    model.inference.method=euler model.inference.num_steps=10
+# Custom alpha and radius
+./scripts/eval.sh --policy=pi0 --alpha=0.05 --max_radius=1.5
+
+# Python API
+python -m src.run_eval --policy=random --benchmark=libero --suite=libero_spatial
 ```
 
-## Parameter Budget (Approximate)
+## File Structure
 
-| Component | Params | Trainable | Notes |
-|-----------|--------|-----------|-------|
-| V-JEPA 2 Encoder (frozen) | 300M | 0 | Unfrozen last 2 layers during fine-tuning |
-| Language Adapter (all-mpnet-base-v2) | 109M (frozen) + 12M (learned) | 12M | Cross-attention + spatial reasoning |
-| Task-Conditioned Metric | ~500K | 500K | Small MLP: task_dim → 6 |
-| Velocity Field (flow head) | ~15M | 15M | 6-layer MLP with FiLM |
-| Learned Halting Network | ~10K | 10K | Tiny MLP for halting probability |
-| Conformal (LieScorer + calibrator) | ~0 | 0 | Pure computation, no learned params |
-| **Total** | **~436M** | **~28M** | Mostly frozen encoder |
-
-**Note**: The conformal module has zero learned parameters — it's a statistical procedure,
-not a neural network. The numbers above are approximate and depend on exact model choices.
-
-## Expected Latency (Theoretical, Not Measured)
-
-These are **estimates** based on parameter counts and typical GPU throughput. They have
-not been benchmarked.
-
-| Component | Est. Latency | Notes |
-|-----------|-------------|-------|
-| V-JEPA 2 encoder (300M) | ~8ms | ViT-L/16 on A100 |
-| Language encoding | ~2ms | Frozen backbone |
-| Flow matching (adaptive, easy) | ~5ms | 5-10 ODE steps |
-| Flow matching (adaptive, hard) | ~15ms | 20-50 ODE steps |
-| Conformal check | <1ms | No neural net |
-| **Total (easy task)** | **~16ms** | ~60 Hz |
-| **Total (hard task)** | **~26ms** | ~38 Hz |
+```
+src/
+├── policies/
+│   ├── base.py           # Abstract BasePolicy interface
+│   ├── openvla.py        # OpenVLA adapter
+│   ├── pi0.py            # π₀ adapter
+│   ├── jepa_vla.py       # JEPA-VLA adapter
+│   └── random.py         # Random baseline
+├── conformal/
+│   ├── lie_scorer.py     # SE(3) nonconformity scores
+│   ├── online_calibration.py  # Gibbs-Candès adaptive conformal
+│   └── safe_policy.py    # Safety wrapper for any VLA
+├── flow/
+│   ├── se3_utils.py      # SE(3) exp/log/geodesic
+│   └── se3_manifold.py   # SE3 manifold for flow_matching
+└── evaluation/
+    ├── libero_eval.py    # LIBERO benchmark
+    ├── metaworld_eval.py # MetaWorld benchmark
+    └── comparison.py     # SAFE comparison framework
+```

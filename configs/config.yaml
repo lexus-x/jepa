@@ -1,31 +1,38 @@
-# VL-JEPA main configuration
-# Uses Hydra for composable config management
+# SE(3) Conformal Safety — Configuration
 
 defaults:
-  - model: vljepa
-  - training: default
-  - benchmark: libero
   - _self_
 
-# Project metadata
 project:
-  name: vl-jepa
-  description: "Vision-Language Joint Embedding Predictive Architecture for Robotic Manipulation"
-  version: "0.2.0"
+  name: se3-conformal-safety
+  description: "Geometric safety guarantees for learned robot policies via conformal prediction on SE(3)"
+  version: "0.1.0"
 
-# Global settings
 seed: 42
 device: cuda
-debug: false
+
+# Conformal settings
+conformal:
+  alpha: 0.1              # 90% coverage target
+  safety_radius: 2.0      # max radius before fallback
+  eta: 0.005              # Gibbs-Candès learning rate
+  decay: 0.995            # exponential decay for old scores
+  window_size: 1000       # score history window
+  min_scores: 30          # minimum scores before predicting
+
+# Policy selection
+policy:
+  name: random            # "openvla", "pi0", "jepa", "random"
+  checkpoint: null
+
+# Evaluation
+eval:
+  benchmark: libero       # "libero" or "metaworld"
+  suite: libero_spatial
+  num_episodes: 20
+  max_episode_steps: 300
+  resolution: 256
 
 # Logging
 logging:
   level: INFO
-  format: "%(asctime)s | %(name)s | %(levelname)s | %(message)s"
-
-# Paths
-paths:
-  data: data/
-  checkpoints: checkpoints/
-  logs: logs/
-  videos: eval_videos/

@@ -1,4 +1,4 @@
-"""Conformal prediction components for VL-JEPA."""
+"""Conformal prediction on SE(3) for safe robot policies."""
 
 from .lie_scorer import LieScorer
 from .online_calibration import OnlineConformalCalibrator

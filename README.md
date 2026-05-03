@@ -1,145 +1,95 @@
-# VL-JEPA: Vision-Language Joint-Embedding Predictive Architecture for Robot Manipulation
+# SE(3) Conformal Prediction for Safe Robot Policies
 
-<p align="center">
-  <a href="https://arxiv.org/abs/2506.09985"><img src="https://img.shields.io/badge/V--JEPA%202-Reference-blue" alt="V-JEPA 2"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
-  <a href="https://pytorch.org"><img src="https://img.shields.io/badge/PyTorch-2.1+-ee4c2c.svg" alt="PyTorch"></a>
-</p>
+**Geometric safety guarantees for learned robot policies via conformal prediction on SE(3).**
 
-> **Status: Research prototype.** No benchmark results yet — target numbers below are aspirational baselines from related work, not claims.
+## The Problem
 
----
+VLAs fail silently.  When OpenVLA, π₀, or JEPA-VLA makes a mistake, there's no
+mechanism to detect it or provide a safe fallback.  Existing failure detectors
+(SAFE) reduce this to a scalar — you know *something* is wrong, but not *what*
+or *where*.
 
-## What Is This?
+## The Approach
 
-VL-JEPA extends [V-JEPA 2](https://arxiv.org/abs/2506.09985) (Meta FAIR, June 2025) for closed-loop robot manipulation. The core hypothesis: a video model trained on 1M+ hours of internet video learns dynamics-aware representations that transfer better to robotics than VLM features trained for semantic alignment.
+We wrap **any VLA** with conformal prediction on SE(3), producing geodesic ball
+prediction sets with **distribution-free coverage guarantees**:
 
-V-JEPA 2 already demonstrates zero-shot pick-and-place on Franka arms with only 62 hours of DROID post-training ([paper §4](https://arxiv.org/html/2506.09985v1)). VL-JEPA adds:
+```python
+from src.policies import OpenVLAPolicy
+from src.conformal import SafePolicyWrapper, OnlineConformalCalibrator
 
-- **Language conditioning** for instruction-following (V-JEPA 2 is action-free by default)
-- **SE(3) flow matching** head for geometrically consistent action generation
-- **Adaptive Neural ODE** for variable-compute inference
-- **Conformal prediction** for calibrated safety filtering
+# Wrap any VLA with conformal safety
+policy = OpenVLAPolicy(model_name="openvla/openvla-7b")
+safe = SafePolicyWrapper(
+    policy=policy,
+    calibrator=OnlineConformalCalibrator(alpha=0.1),  # 90% coverage
+    max_radius=2.0,  # fallback if radius exceeds this
+)
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         VL-JEPA                                 │
-│                                                                 │
-│  ┌──────────┐   ┌──────────────┐   ┌────────────────────────┐  │
-│  │  RGB     │   │  V-JEPA 2    │   │  Adaptive Neural ODE   │  │
-│  │  Frames  │──▶│  ViT-L       │──▶│  (complexity-adaptive) │  │
-│  │  (T=4)   │   │  (frozen)    │   │                        │  │
-│  └──────────┘   └──────┬───────┘   └───────────┬────────────┘  │
-│                        │                       │                │
-│                        ▼                       ▼                │
-│                  ┌──────────┐        ┌──────────────────┐       │
-│                  │  T5-XXS  │        │  SE(3) Flow      │       │
-│                  │  Language │───────▶│  Matching Head    │       │
-│                  │  Encoder  │        │  (R³ × SO(3))    │       │
-│                  └──────────┘        └────────┬─────────┘       │
-│                                               │                 │
-│                                               ▼                 │
-│                                      ┌──────────────────┐       │
-│                                      │  Conformal        │       │
-│                                      │  Safety Filter    │       │
-│                                      └──────────────────┘       │
-└─────────────────────────────────────────────────────────────────┘
+# Use like a normal policy
+action, info = safe.act(observation, "pick up the red cup")
+# action: [1, 4, 4] SE(3) pose
+# info: {"radius": 0.3, "fallback": False, "halted": False}
 ```
 
-## Motivation
+## Why SE(3) Conformal > Scalar Detectors
 
-| Approach | Example | What It Optimizes | Limitation for Robotics |
-|---|---|---|---|
-| VLM-based VLA | OpenVLA, RoboVLM | Image-text alignment | No temporal modeling, semantic bias |
-| Video generation | UniPi, SuSIE | Pixel-level prediction | Expensive planning, irrelevant detail |
-| **JEPA (ours)** | **VL-JEPA** | **Representation-space dynamics** | **None (this is the repo)** |
-
-V-JEPA 2's key insight (from [LeCun 2022](https://openreview.net/forum?id=BZ5a1r-kVsf)): predict *what changes* in representation space, not pixels. This naturally learns contact dynamics, object motion, and tool use without explicit supervision.
-
-## Target Benchmarks
-
-These are **aspirational targets** based on related work, not reported results:
-
-| Benchmark | Metric | Current SOTA | Target | Source |
-|---|---|---|---|---|
-| LIBERO Spatial | Success % | ~97-98% | >96% | [LIBERO paper](https://arxiv.org/abs/2306.03310) |
-| LIBERO Object | Success % | ~95-97% | >95% | |
-| LIBERO Goal | Success % | ~95-97% | >95% | |
-| LIBERO Long | Success % | ~90-95% | >92% | |
-| CALVIN ABC→D | Avg Length | 4.44 (DreamVLA) | >4.3 | [DreamVLA](https://arxiv.org/abs/2507.04447) |
-| MetaWorld MT10 | Success % | ~85-89% | >85% | Various |
-
-**Note**: LIBERO is [essentially saturated](https://mbreuss.github.io/blog_post_iclr_26_vla.html) — properly tuned Diffusion Policies hit 95%+ without VLMs. The real test is CALVIN and real-world transfer.
+| | SAFE (scalar) | SE(3) Conformal |
+|--|--------------|-----------------|
+| Output | P(failure) ∈ [0,1] | Ball in SE(3) with radius r |
+| Geometry | None | Rotation vs translation breakdown |
+| Guarantee | Heuristic | P(T_true ∈ C_α) ≥ 1-α |
+| Adaptation | Fixed threshold | Gibbs-Candès online |
+| Failure mode | "Something's wrong" | "Rotation is off by 0.3 rad" |
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/lexus-x/jepa.git
-cd jepa
+# Random policy baseline (no VLA needed, tests the conformal layer)
+./scripts/eval.sh --policy=random --all
 
-conda create -n vljepa python=3.10 -y
-conda activate vljepa
-pip install -e ".[dev]"
+# With a real VLA
+./scripts/eval.sh --policy=openvla --suite=libero_spatial
 
-# Download V-JEPA 2 checkpoint (from Meta)
-bash scripts/download_vjepa2.sh
-
-# Verify installation
-python tests/smoke_test.py
+# Custom conformal parameters
+./scripts/eval.sh --policy=pi0 --alpha=0.05 --max_radius=1.5
 ```
 
-See [docs/setup.md](docs/setup.md) for full installation (including LIBERO's MuJoCo requirements).
+## Supported Policies
 
-## Repository Structure
+| Policy | Adapter | Notes |
+|--------|---------|-------|
+| OpenVLA | `OpenVLAPolicy` | 7D → SE(3) conversion |
+| π₀ | `PiZeroPolicy` | Action chunk → first action → SE(3) |
+| JEPA-VLA | `JEPAPolicy` | Native SE(3) output |
+| Random | `RandomPolicy` | Baseline for testing |
+
+## How It Works
+
+1. **LieScorer** computes nonconformity: `s(T_pred, T_true) = ‖log(T_pred⁻¹ T_true)‖`
+2. **OnlineConformalCalibrator** tracks scores with Gibbs-Candès adaptation
+3. **SafePolicyWrapper** checks radius before returning each action
+4. If radius > threshold → fallback (identity = no movement)
+5. Statistics tracked: coverage rate, intervention rate, radius evolution
+
+## Key Hypotheses
+
+1. **SE(3) conformal sets are tighter** than scalar detectors at matched coverage
+2. **Adaptive ODE steps correlate with conformal radius** (more steps = less certain)
+3. **Gibbs-Candès handles distribution shift** (valid coverage under domain change)
+
+See [docs/architecture.md](docs/architecture.md) for the full experimental design.
+
+## Project Structure
 
 ```
-├── README.md
-├── CONTRIBUTING.md
-├── LICENSE
-├── docs/
-│   ├── setup.md              # Installation & dependencies
-│   ├── training.md           # 4-phase training pipeline
-│   ├── evaluation.md         # Benchmark evaluation
-│   ├── architecture.md       # Design rationale & ablations
-│   ├── ssh_workflow.md       # Remote dev workflow
-│   └── reproducibility.md    # Seeds, determinism, tracking
-├── configs/                  # YAML training configs
-├── scripts/                  # Entry points
-├── vljepa/                   # Core library
-│   ├── models/
-│   │   ├── backbone.py       # V-JEPA 2 encoder wrapper
-│   │   ├── language.py       # T5 language encoder
-│   │   ├── flow_matching.py  # SE(3) flow matching head
-│   │   ├── neural_ode.py     # Adaptive Neural ODE
-│   │   └── conformal.py      # Conformal prediction
-│   ├── data/                 # Datasets & transforms
-│   ├── training/             # Trainer, losses, schedulers
-│   └── evaluation/           # LIBERO/MetaWorld eval harness
-└── tests/
-```
-
-## Training Pipeline
-
-| Phase | What | Data | Time (4×A100) |
-|---|---|---|---|
-| 1 | V-JEPA 2 pretrained | 1M+ hours video (Meta's checkpoint) | — |
-| 2 | Action-conditioned post-training | 62h DROID dataset | ~48h |
-| 3 | Conformal calibration | Calibration split | ~2h |
-| 4 | Benchmark fine-tuning | LIBERO / MetaWorld | ~12h each |
-
-See [docs/training.md](docs/training.md) for exact commands.
-
-## Citation
-
-```bibtex
-@article{vjepa2,
-  title   = {V-JEPA 2: Self-Supervised Video Models Enable Understanding, Prediction and Planning},
-  author  = {Assran, Mido and Bardes, Adrien and Fan, David and Garrido, Quentin and Howes, Russell and others},
-  journal = {arXiv preprint arXiv:2506.09985},
-  year    = {2025}
-}
+src/
+├── policies/           # VLA adapters (any VLA → SE(3))
+├── conformal/          # Core: LieScorer, OnlineCalibrator, SafeWrapper
+├── flow/se3_*.py       # SE(3) Lie group utilities
+└── evaluation/         # LIBERO, MetaWorld, SAFE comparison
 ```
 
 ## License
 
-Apache 2.0. V-JEPA 2 checkpoints are subject to [Meta's model license](https://github.com/facebookresearch/vjepa2).
+MIT

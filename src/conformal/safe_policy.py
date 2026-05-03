@@ -1,26 +1,26 @@
-"""Safe policy wrapper that integrates conformal prediction into the control loop.
+"""Safe policy wrapper: conformal safety for any VLA.
 
-This is the missing piece: the conformal calibrator was a standalone module
-that nothing called.  SafePolicyWrapper wraps any SE(3) policy and:
+This is the main entry point for the framework.  Wraps any ``BasePolicy``
+with conformal prediction guarantees on SE(3):
 
-    1. Runs the policy to get a point prediction
-    2. Queries the conformal calibrator for the current radius
-    3. Validates the prediction against the safety threshold
-    4. Falls back to a conservative action if the prediction is outside
-       the conformal set or the calibrator has halted
-    5. Updates the calibrator with ground truth when available (for online adaptation)
+    1. Policy predicts T_pred ∈ SE(3)
+    2. Conformal calibrator returns radius r
+    3. If r > threshold or calibrator halted → fallback action
+    4. Otherwise → return T_pred (with coverage guarantee)
 
-This is what actually gets used at deployment time.
+The wrapper also tracks statistics for benchmarking: coverage rate,
+intervention rate, radius evolution.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Optional
+from typing import Optional
 
 import torch
 from torch import Tensor
 
+from ..policies.base import BasePolicy
 from .online_calibration import OnlineConformalCalibrator
 from .lie_scorer import LieScorer
 
@@ -28,47 +28,45 @@ logger = logging.getLogger(__name__)
 
 
 class SafePolicyWrapper:
-    """Wraps an SE(3) policy with conformal safety guarantees.
+    """Conformal safety wrapper for SE(3) policies.
 
-    At each step:
-        1. Policy produces a predicted action T_pred ∈ SE(3)
-        2. Conformal calibrator returns the current radius r
-        3. If r > max_radius (distribution shift detected), use fallback
-        4. If calibration is insufficient (< min_scores), use fallback
-        5. Otherwise, return T_pred (with optional noise for exploration)
-
-    When ground truth is available (e.g., during evaluation), the wrapper
-    updates the calibrator to maintain valid coverage.
+    Wraps any ``BasePolicy`` with:
+        - Online conformal calibration (Gibbs-Candès)
+        - Geodesic ball prediction sets on SE(3)
+        - Safety halt + fallback when distribution shifts
+        - Statistics tracking for benchmarking
 
     Args:
-        policy_fn: Callable that produces SE(3) actions.
-            Signature: (images, instruction, proprioception, encoder) → [B, 4, 4]
-        calibrator: Online conformal calibrator.
+        policy: Any VLA that implements ``predict_action``.
+        calibrator: Online conformal calibrator.  If None, creates a default.
         max_radius: Maximum allowed conformal radius before fallback.
-        fallback_action: Conservative action to use when safety is violated.
-            If None, uses identity (no movement).
+        fallback_action: Conservative fallback.  If None, uses identity (no move).
         enable_logging: Whether to log safety interventions.
     """
 
     def __init__(
         self,
-        policy_fn: Callable[..., Tensor],
+        policy: BasePolicy,
         calibrator: Optional[OnlineConformalCalibrator] = None,
         max_radius: float = 2.0,
         fallback_action: Optional[Tensor] = None,
         enable_logging: bool = True,
     ) -> None:
-        self.policy_fn = policy_fn
+        self.policy = policy
         self.calibrator = calibrator or OnlineConformalCalibrator()
         self.max_radius = max_radius
         self._fallback_action = fallback_action
         self.enable_logging = enable_logging
 
+        # Scorer for evaluation
+        self._scorer = LieScorer()
+
         # Statistics
         self._total_calls = 0
         self._fallback_count = 0
         self._halt_count = 0
-        self._insufficient_calibration_count = 0
+        self._radius_history: list[float] = []
+        self._coverage_history: list[bool] = []
 
     # ------------------------------------------------------------------
     # Main interface
@@ -76,61 +74,61 @@ class SafePolicyWrapper:
 
     def act(
         self,
-        images: Tensor,
+        observation: dict,
         instruction: str,
-        proprioception: Optional[Tensor] = None,
-        encoder: Any = None,
-        device: Optional[torch.device] = None,
-    ) -> Tensor:
+    ) -> tuple[Tensor, dict]:
         """Produce a safe SE(3) action.
 
         Args:
-            images: [B, 3, T, H, W] RGB frames.
-            instruction: Natural language instruction.
-            proprioception: [B, D_proprio] proprioceptive state.
-            encoder: V-JEPA 2 encoder.
-            device: Target device.
+            observation: Dict with at least "image" key.
+            instruction: Natural language task instruction.
 
         Returns:
             action: [B, 4, 4] safe SE(3) action.
+            info: Dict with:
+                - "radius": current conformal radius
+                - "fallback": whether fallback was used
+                - "halted": whether calibrator is halted
+                - "raw_action": the policy's original prediction (if different)
         """
         self._total_calls += 1
-        B = images.shape[0]
-
-        if device is None:
-            device = images.device
-
-        # Get conformal radius
         radius = self.calibrator.current_radius()
+        self._radius_history.append(radius)
 
-        # Check safety conditions
+        # Safety checks
         if self.calibrator.is_halted:
             self._halt_count += 1
             if self.enable_logging:
-                logger.warning(
-                    "Conformal calibrator HALTED: %s. Using fallback action.",
-                    self.calibrator.halt_reason,
-                )
-            return self._get_fallback(B, device)
+                logger.warning("HALTED: %s", self.calibrator.halt_reason)
+            return self._get_fallback(observation), {
+                "radius": radius, "fallback": True, "halted": True,
+                "raw_action": None,
+            }
 
         if radius > self.max_radius:
             self._fallback_count += 1
             if self.enable_logging:
-                logger.warning(
-                    "Conformal radius %.4f exceeds max %.4f. Using fallback.",
-                    radius, self.max_radius,
-                )
-            return self._get_fallback(B, device)
+                logger.warning("Radius %.4f > max %.4f", radius, self.max_radius)
+            return self._get_fallback(observation), {
+                "radius": radius, "fallback": True, "halted": False,
+                "raw_action": None,
+            }
 
-        # Run the policy
+        # Run policy
         try:
-            T_pred = self.policy_fn(images, instruction, proprioception, encoder)
+            T_pred = self.policy.predict_action(observation, instruction)
         except Exception as e:
-            logger.error("Policy failed: %s. Using fallback.", str(e))
+            logger.error("Policy failed: %s", str(e))
             self._fallback_count += 1
-            return self._get_fallback(B, device)
+            return self._get_fallback(observation), {
+                "radius": radius, "fallback": True, "halted": False,
+                "raw_action": None,
+            }
 
-        return T_pred
+        return T_pred, {
+            "radius": radius, "fallback": False, "halted": False,
+            "raw_action": T_pred,
+        }
 
     def update(
         self,
@@ -139,100 +137,127 @@ class SafePolicyWrapper:
     ) -> dict:
         """Update the calibrator with observed ground truth.
 
-        Call this during evaluation or when you have access to the true
-        action that should have been taken (e.g., from a demonstrator).
+        Call this during evaluation with the true action that should have
+        been taken (e.g., from a demonstrator or simulator).
 
         Args:
             T_pred: [B, 4, 4] predicted actions.
             T_true: [B, 4, 4] ground truth actions.
 
         Returns:
-            info: Calibrator update information (scores, coverage, radius).
+            info: Calibrator update info (scores, coverage, radius).
         """
-        return self.calibrator.update(T_pred, T_true)
+        result = self.calibrator.update(T_pred, T_true)
+        # Track coverage
+        if result["covered"] is not None:
+            for c in result["covered"].tolist():
+                self._coverage_history.append(bool(c))
+        return result
 
     # ------------------------------------------------------------------
-    # Batch evaluation with safety tracking
+    # Benchmarking
     # ------------------------------------------------------------------
 
-    def evaluate_batch(
+    def evaluate_trajectory(
         self,
-        predictions: Tensor,
-        ground_truths: Tensor,
+        trajectory: list[tuple[dict, str, Tensor]],
     ) -> dict:
-        """Evaluate a batch of predictions with conformal safety tracking.
+        """Evaluate a full trajectory with conformal tracking.
 
         Args:
-            predictions: [B, 4, 4] predicted SE(3) poses.
-            ground_truths: [B, 4, 4] ground truth poses.
+            trajectory: List of (observation, instruction, ground_truth_action).
 
         Returns:
-            metrics: Dictionary with:
-                - "scores": nonconformity scores
-                - "covered": coverage mask
-                - "radius": current conformal radius
-                - "would_fallback": which samples would trigger fallback
-                - "coverage_rate": fraction covered
-                - "fallback_rate": fraction that would fallback
+            results: Dict with per-step and aggregate metrics.
         """
-        scorer = LieScorer()
-        scores = scorer.score(predictions, ground_truths)
-        radius = self.calibrator.current_radius()
+        predictions = []
+        ground_truths = []
+        actions_taken = []
+        radii = []
+        fallbacks = []
 
-        covered = scores <= radius
-        would_fallback = (radius > self.max_radius) | self.calibrator.is_halted
+        for obs, instr, gt_action in trajectory:
+            T_pred, info = self.act(obs, instr)
+            predictions.append(T_pred)
+            ground_truths.append(gt_action)
+            actions_taken.append(T_pred if not info["fallback"] else self._get_fallback(obs))
+            radii.append(info["radius"])
+            fallbacks.append(info["fallback"])
+
+            # Update calibrator with ground truth
+            self.update(T_pred, gt_action.unsqueeze(0))
+
+        predictions = torch.cat(predictions, dim=0)
+        ground_truths = torch.stack(ground_truths)
+        actions_taken = torch.cat(actions_taken, dim=0)
+
+        # Compute scores
+        scores = self._scorer.score(predictions, ground_truths)
 
         return {
             "scores": scores,
-            "covered": covered,
-            "radius": radius,
-            "would_fallback": would_fallback,
-            "coverage_rate": covered.float().mean().item(),
-            "fallback_rate": float(would_fallback),
+            "radii": radii,
+            "fallbacks": fallbacks,
+            "mean_score": scores.mean().item(),
+            "mean_radius": sum(radii) / len(radii),
+            "fallback_rate": sum(fallbacks) / len(fallbacks),
+            "coverage_rate": sum(self._coverage_history[-len(trajectory):]) / len(trajectory),
         }
-
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
 
     @property
     def stats(self) -> dict:
-        """Return safety intervention statistics."""
+        """Return aggregate statistics."""
         return {
             "total_calls": self._total_calls,
             "fallback_count": self._fallback_count,
             "halt_count": self._halt_count,
-            "insufficient_calibration": self._insufficient_calibration_count,
             "fallback_rate": self._fallback_count / max(self._total_calls, 1),
+            "coverage_rate": (
+                sum(self._coverage_history) / len(self._coverage_history)
+                if self._coverage_history else 0.0
+            ),
+            "mean_radius": (
+                sum(self._radius_history) / len(self._radius_history)
+                if self._radius_history else 0.0
+            ),
             "current_radius": self.calibrator.current_radius(),
             "calibrator_halted": self.calibrator.is_halted,
+            "policy_name": self.policy.name(),
         }
 
-    def reset_stats(self) -> None:
-        """Reset intervention counters."""
-        self._total_calls = 0
-        self._fallback_count = 0
-        self._halt_count = 0
-        self._insufficient_calibration_count = 0
+    @property
+    def radius_history(self) -> list[float]:
+        return self._radius_history
+
+    @property
+    def coverage_history(self) -> list[bool]:
+        return self._coverage_history
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
-    def _get_fallback(self, batch_size: int, device: torch.device) -> Tensor:
-        """Generate a fallback (conservative) action.
-
-        Returns identity if no fallback is configured (safest: do nothing).
-        """
+    def _get_fallback(self, observation: dict) -> Tensor:
+        """Generate a fallback action (identity = no movement)."""
         if self._fallback_action is not None:
-            return self._fallback_action.expand(batch_size, -1, -1).to(device)
+            return self._fallback_action.unsqueeze(0)
 
-        # Identity: safest action is to not move
-        return torch.eye(4, device=device).unsqueeze(0).expand(batch_size, -1, -1)
+        image = observation["image"]
+        B = image.shape[0]
+        device = image.device
+        return torch.eye(4, device=device).unsqueeze(0).expand(B, -1, -1)
+
+    def reset_stats(self) -> None:
+        """Reset all statistics."""
+        self._total_calls = 0
+        self._fallback_count = 0
+        self._halt_count = 0
+        self._radius_history.clear()
+        self._coverage_history.clear()
 
     def __repr__(self) -> str:
         return (
-            f"SafePolicyWrapper(max_radius={self.max_radius}, "
-            f"calibrator={self.calibrator}, "
-            f"fallback_rate={self.stats['fallback_rate']:.3f})"
+            f"SafePolicyWrapper(policy={self.policy.name()}, "
+            f"max_radius={self.max_radius}, "
+            f"calls={self._total_calls})"
         )

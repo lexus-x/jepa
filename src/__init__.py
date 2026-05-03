@@ -1,7 +1,8 @@
-"""VL-JEPA: Vision-Language Joint Embedding Predictive Architecture for Robotic Manipulation.
+"""SE(3) Conformal Prediction for Safe Robot Policies.
 
-A Riemannian flow matching framework for SE(3) action prediction conditioned on
-V-JEPA 2 visual representations and natural language instructions.
+Geometric safety guarantees for learned robot policies via conformal
+prediction on SE(3).  Wraps any VLA (OpenVLA, π₀, JEPA-VLA, etc.) with
+distribution-free coverage guarantees on the SE(3) action space.
 """
 
 __version__ = "0.1.0"
